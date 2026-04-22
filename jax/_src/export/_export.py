@@ -22,11 +22,9 @@ import dataclasses
 import functools
 import itertools
 import json
+import logging
 import re
 from typing import Any, Protocol, TypeVar, Union, cast
-
-import logging
-import numpy as np
 
 from jax._src import ad_util
 from jax._src import api
@@ -37,14 +35,6 @@ from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import effects
 from jax._src import mesh as mesh_lib
-from jax._src.interpreters import mlir
-from jax._src.interpreters import pxla
-from jax._src.lax import linalg
-from jax._src.lib import xla_client
-from jax._src.lib import _jax
-from jax._src.lib.mlir import ir, passmanager
-from jax._src.lib.mlir.dialects import hlo
-from jax._src.lib.mlir.dialects import func as func_dialect, sdy
 from jax._src import pjit
 from jax._src import sharding
 from jax._src import sharding_impls
@@ -55,8 +45,17 @@ from jax._src import tree_util
 from jax._src import typing
 from jax._src import util
 from jax._src import xla_bridge as xb
-
 from jax._src.export import shape_poly
+from jax._src.interpreters import mlir
+from jax._src.interpreters import pxla
+from jax._src.lax import linalg
+from jax._src.lib import _jax
+from jax._src.lib import jaxlib_extension_version
+from jax._src.lib import xla_client
+from jax._src.lib.mlir import ir, passmanager
+from jax._src.lib.mlir.dialects import func as func_dialect, sdy
+from jax._src.lib.mlir.dialects import hlo
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -916,8 +915,20 @@ def _module_to_bytecode(module: ir.Module) -> bytes:
   target_version = hlo.get_version_from_compatibility_requirement(
     hlo.StablehloCompatibilityRequirement.WEEK_4)
 
-  module_serialized = _jax.mlir.serialize_portable_artifact(
-      module, target_version, xb.get_backend().serialize_with_sdy)
+  if jaxlib_extension_version >= 461:
+    sdy_version = sdy.get_version_from_compatibility_requirement(
+        sdy.CompatibilityRequirement.WEEK_4
+    )
+    module_serialized = _jax.mlir.serialize_portable_artifact(
+        module,
+        target_version,
+        sdy_version,
+        xb.get_backend().serialize_with_sdy,
+    )
+  else:
+    module_serialized = _jax.mlir.serialize_portable_artifact(
+        module, target_version, xb.get_backend().serialize_with_sdy
+    )
   return module_serialized
 
 
