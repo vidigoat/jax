@@ -52,6 +52,7 @@ from jax._src.lax import control_flow
 from jax._src.lax import lax as lax_internal
 from jax._src.lax.control_flow import BranchesPlatforms
 from jax._src.lib import jax_mlir_ext
+from jax._src.lib import jaxlib_extension_version
 from jax._src.lib import xla_client
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
@@ -4594,10 +4595,11 @@ def _device_id_to_logical(
 
     # We resolve the axis indices in the code below. We already asserted that
     # the required axis names are present in the current kernel type's mesh.
+    subcore_index = None
     if dest_kernel_type == tpu_core.CoreType.SC_VECTOR_SUBCORE:
       if not mpmd_core_axis_names and dest_kernel_type == kernel_type:
         # short circuit for same core semaphores without a core type annotation
-        return logical_device_id, None
+        return logical_device_id, None, None
       assert isinstance(dest_mesh, sc_core.VectorSubcoreMesh), (
           f"Unrecognized dest_mesh: {type(dest_mesh)} != VectorSubcoreMesh")
       sc_info = tpu_info.get_tpu_info().sparse_core
@@ -4606,11 +4608,15 @@ def _device_id_to_logical(
         core_id = lax.axis_index(dest_mesh.core_axis_name)
       if (subcore_id := core_index_map[dest_mesh.subcore_axis_name]) is None:
         subcore_id = lax.axis_index(dest_mesh.subcore_axis_name)
-      core_index = sc_info.num_subcores * core_id + subcore_id
+      if jaxlib_extension_version < 460:
+        core_index = sc_info.num_subcores * core_id + subcore_id
+      else:
+        core_index = core_id
+        subcore_index = subcore_id
     elif dest_kernel_type == tpu_core.CoreType.SC_SCALAR_SUBCORE:
       if not mpmd_core_axis_names and dest_kernel_type == kernel_type:
         # short circuit for same core semaphores without a core type annotation
-        return logical_device_id, None
+        return logical_device_id, None, None
       assert isinstance(dest_mesh, sc_core.ScalarSubcoreMesh), (
           f"Unrecognized dest_mesh: {type(dest_mesh)} != ScalarSubcoreMesh")
       if (core_id := core_index_map[dest_mesh.axis_name]) is None:
@@ -4633,7 +4639,7 @@ def _device_id_to_logical(
       else:
         raise ValueError(
             f"Expected zero or one core index, got {core_index_map=}.")
-    return logical_device_id, core_index
+    return logical_device_id, core_index, subcore_index
 
   return lower_fun(jax_fn, in_avals=(device_id_aval,))(ctx, device_id)
 
@@ -4684,10 +4690,11 @@ def _semaphore_signal_lowering_rule(
   else:
     dest_mesh = None
     dest_kernel_type = kernel_type
+  subcore_index = None
   if device_id is not None or dest_kernel_type != kernel_type:
     # TODO(rdyro): Unify the `core_index` argument to use core meshes instead.
     with ctx.lowering_context.grid_name_context():
-      device_id, core_id = _device_id_to_logical(
+      device_id, core_id, subcore_index = _device_id_to_logical(
           ctx, device_id, device_id_type, device_id_aval,
           dest_mesh=dest_mesh
       )
@@ -4697,7 +4704,14 @@ def _semaphore_signal_lowering_rule(
             "Cannot specify both `core_index` and the core axis in `device_id`."
         )
       core_index = core_id
-  tpu.sem_signal(sem, value, device_id=device_id, core_id=core_index)
+  if jaxlib_extension_version < 460:
+    assert subcore_index is None, (
+        "`subcore_index` is not supported in this version of jaxlib."
+    )
+    tpu.sem_signal(sem, value, device_id=device_id, core_id=core_index)
+  else:
+    tpu.sem_signal(sem, value, device_id=device_id, core_id=core_index,
+                   subcore_id=subcore_index)  # pyrefly: ignore[unexpected-keyword]
   return []
 
 
@@ -4740,22 +4754,38 @@ def _dma_start_lowering_rule(
     dest_mesh = None
     dest_kernel_type = kernel_type
   core_id = None
+  subcore_id = None
   if device_id is not None or dest_kernel_type != kernel_type:
     with ctx.lowering_context.grid_name_context():
-      device_id, core_id = _device_id_to_logical(
+      device_id, core_id, subcore_id = _device_id_to_logical(
           ctx, device_id, device_id_type, device_id_aval, dest_mesh=dest_mesh
       )
 
   def _dma_start(src_ref, dst_ref, sem, src_sem) -> list[ir.Value]:
-    tpu.enqueue_dma(
-        source=src_ref,
-        target=dst_ref,
-        target_semaphore=sem,
-        source_semaphore=src_sem,
-        device_id=device_id,
-        core_id=core_id,
-        priority=priority,
-    )
+    if jaxlib_extension_version < 460:
+      assert subcore_id is None, (
+          "`subcore_id` is not supported in this version of jaxlib."
+      )
+      tpu.enqueue_dma(
+          source=src_ref,
+          target=dst_ref,
+          target_semaphore=sem,
+          source_semaphore=src_sem,
+          device_id=device_id,
+          core_id=core_id,
+          priority=priority,
+      )
+    else:
+      tpu.enqueue_dma(
+          source=src_ref,
+          target=dst_ref,
+          target_semaphore=sem,
+          source_semaphore=src_sem,
+          device_id=device_id,
+          core_id=core_id,
+          subcore_id=subcore_id,  # pyrefly: ignore[unexpected-keyword]
+          priority=priority,
+      )
     return []
 
   return lower_with_transformed_refs(
@@ -4775,6 +4805,7 @@ def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
   )
   block_shapes = _dma_unflatten(tree, ctx.block_shapes)
 
+  subcore_id = None
   if insert_dummy_device:
     i32 = ir.IntegerType.get_signless(32)
     device_id = core_id = arith.constant(i32, ir.IntegerAttr.get(i32, 0))
@@ -4783,14 +4814,29 @@ def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
       dest_mesh = sem_aval.memory_space.mesh
     else:
       dest_mesh = None
-    device_id, core_id = _device_id_to_logical(
+    device_id, core_id, subcore_id = _device_id_to_logical(
         ctx, device_id, device_id_type, device_id_aval, dest_mesh=dest_mesh
     )
   else:
     core_id = None
 
   def _dma_wait(src_ref, dst_ref, sem) -> list[ir.Value]:
-    tpu.wait_dma2(sem, src_ref, dst_ref, device_id=device_id, core_id=core_id)
+    if jaxlib_extension_version < 460:
+      assert subcore_id is None, (
+          "`subcore_id` is not supported in this version of jaxlib."
+      )
+      tpu.wait_dma2(
+          sem, src_ref, dst_ref, device_id=device_id, core_id=core_id
+      )
+    else:
+      tpu.wait_dma2(
+          sem,
+          src_ref,
+          dst_ref,
+          device_id=device_id,
+          core_id=core_id,
+          subcore_id=subcore_id,  # pyrefly: ignore[unexpected-keyword]
+      )
     return []
 
   return lower_with_transformed_refs(_dma_wait, [src, dst, sem], [src_aval, dst_aval, sem_aval], block_shapes[:3])
