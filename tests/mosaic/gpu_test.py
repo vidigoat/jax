@@ -4672,6 +4672,8 @@ class FragmentedArrayTest(TestCase):
   )
   def test_bitwise(self, op, dtype, m=64, n=8):
     is_shift = op in {operator.lshift, operator.rshift}
+    if is_shift and dtype == jnp.uint8:
+      self.skipTest("Shift ops are unsupported on 8-bit types.")
     def kernel(ctx, dst, _):
       iota = iota_tensor(m, n, dtype)
       rhs = iota & 0xf if is_shift else iota << 2
