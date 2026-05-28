@@ -954,14 +954,7 @@ class TMEMLayout(fa.TiledLayout):
 
   def cols_in_shape(self, shape: tuple[int, int], bitwidth: int) -> int:
     self.check_type(shape, bitwidth)
-    replication_factor = 1
-    for dim in self.warp_dims:
-      if isinstance(dim, fa.Replicated):
-        replication_factor *= dim.times
-    for dim in self.lane_dims:
-      if isinstance(dim, fa.Replicated):
-        replication_factor *= dim.times
-    return math.prod(shape) * replication_factor // TMEM_ROWS // self.vector_length
+    return math.prod(shape) * self.replication_factor // TMEM_ROWS // self.vector_length
 
   def canonicalize(self) -> TMEMLayout:
     layout = super().canonicalize()
@@ -1182,24 +1175,23 @@ class TMEMRef:
     if any(is_squeezed):
       raise ValueError("TMEM can only be sliced, not indexed")
     if base_idx == [0] * len(base_idx) and slice_shape == list(self.shape):
-      return self  # Trival slice
-    if self.layout != tmem_default_layout(packing=self.packing):
+      return self  # Trivial slice
+    if self.layout.base_tile_shape[0] != TMEM_ROWS:
       raise NotImplementedError(
-          "Slicing only implemented for refs with standard layout, got:"
-          f" {self.layout}"
+          f"Slicing only implemented with layouts using 128 rows, got: "
+          f"{self.layout}"
       )
+    # If we slice along rows, or attempt to extract several rows, then we may
+    # end up with a non-contiguous slice of memory.
     if base_idx[0] != 0 or slice_shape[0] != TMEM_ROWS:
       raise NotImplementedError("TMEM cannot be sliced along rows")
-    if slice_shape[1] % 8:
-      raise NotImplementedError(
-          "TMEM column slice length must be a multiple of 8. "
-          f"Got {slice_shape[1]}."
-      )
     col_idx = base_idx[1]
     if not isinstance(col_idx, ir.Value):
       col_idx = arith.constant(i32, col_idx)
     if col_idx.type == ir.IndexType.get():
       col_idx = arith.index_cast(i32, col_idx)
+    if (rep := self.layout.replication_factor) > 1:
+      col_idx = arith.muli(col_idx, arith.constant(i32, rep))
     if self.packing != 1:
       col_idx = arith.divui(col_idx, arith.constant(i32, self.packing))
     return TMEMRef(
@@ -1226,21 +1218,9 @@ class TMEMRef:
       ).T.reshape(regs_shape)
     elif layout == self.layout.as_tiled_layout() and packing * bitwidth == 32:
       assert len(layout.base_tile_shape) == 2
-      # We could allow replicated dims in the input, but we'd need to divide the
-      # split factor computed below by the replication factor of the input.
-      assert not any(isinstance(d, fa.Replicated) for d in layout.warp_dims)
-      assert not any(isinstance(d, fa.Replicated) for d in layout.lane_dims)
-      warp_split_factor = math.prod(
-          d.times if isinstance(d, fa.Replicated) else 1
-          for d in layout.remove_dimension(1).warp_dims
-      )
-      lane_split_factor = math.prod(
-          d.times if isinstance(d, fa.Replicated) else 1
-          for d in layout.remove_dimension(1).lane_dims
-      )
-      split_factor = warp_split_factor * lane_split_factor
+      cols = math.prod(regs_shape) * packing
       registers = _load_32xcols_native(
-          self.address, self.shape[1] // split_factor, self.dtype, packing, packing
+          self.address, cols, self.dtype, packing, packing
       ).reshape(regs_shape)
     # TODO(apaszke): Support the case where we have a long vector length in the
     # FA more generally, not just for 2x32b.

@@ -1490,6 +1490,64 @@ class TCGen05Test(TestCase, jtu.CudaArchSpecificTest):
     )(x)
     np.testing.assert_array_equal(x, y)
 
+  @parameterized.parameters(
+      ((128, 32), tcgen05.scales_layout()),
+      ((256, 32), tcgen05.b_scales_m64_collective_layout()),
+  )
+  def test_load_store_tmem_scales_layout(self, shape, tmem_layout):
+    reg_layout = tmem_layout.as_tiled_layout()
+    def kernel(ctx, input, output, tmem):
+      del ctx
+      reg = fa.FragmentedArray.load_untiled(
+          input, layout=reg_layout, optimized=False
+      )
+      tmem.store(reg)
+      tcgen05.commit_tmem()
+      tmem.load(reg_layout).store_untiled(output, optimized=False)
+
+    x = self.prng.uniform(-1, 1, shape).astype(jnp.float8_e5m2)
+    y = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        x,
+        mgpu.TMEM(x.shape, x.dtype, layout=tmem_layout),
+    )(x)
+    np.testing.assert_array_equal(x, y)
+
+  @parameterized.parameters(
+      (jnp.float32, tcgen05.LAYOUT, tcgen05.tmem_default_layout(1)),
+      (jnp.float16, tcgen05.LAYOUT, tcgen05.tmem_default_layout(1)),
+      (jnp.float16, tcgen05.LAYOUT, tcgen05.tmem_default_layout(2)),
+      (jnp.float8_e5m2, tcgen05.scales_layout().as_tiled_layout(), tcgen05.scales_layout()),
+  )
+  def test_tmem_column_slicing_128_rows(self, dtype, reg_layout, tmem_layout):
+    shape = (128, 64)
+    slicing = (slice(None), slice(32, 64))
+
+    def kernel(ctx, input, output, tmem):
+      del ctx
+      reg = fa.FragmentedArray.load_untiled(
+          input, layout=reg_layout, optimized=False
+      )
+      tmem.store(reg)
+      tcgen05.commit_tmem()
+      tmem_slice = tmem.slice(*slicing)
+      tmem_slice.load(reg_layout).store_untiled(output, optimized=False)
+
+    x = self.prng.uniform(-1, 1, shape).astype(dtype)
+    expected = x[*slicing]
+    y = mgpu.as_gpu_kernel(
+        kernel,
+        (1, 1, 1),
+        (128, 1, 1),
+        x,
+        expected,
+        mgpu.TMEM(x.shape, x.dtype, layout=tmem_layout),
+    )(x)
+    np.testing.assert_array_equal(expected, y)
+
   def test_mixed_tmem_allocations_raise(self):
     def body(ctx, out, scratch):
       del ctx, out, scratch
