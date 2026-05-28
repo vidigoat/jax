@@ -26,7 +26,8 @@ from jax._src import config
 from jax._src import linear_util as lu
 from jax._src.interpreters import partial_eval as pe
 from jax._src.tree_util import (tree_flatten, tree_unflatten,
-                                register_pytree_node, PyTreeDef, FlatTree)
+                                register_pytree_node, PyTreeDef,
+                                FlatTree, FlatTree as ft)
 from jax._src import mesh as mesh_lib
 from jax._src import core
 from jax._src import source_info_util
@@ -1274,54 +1275,27 @@ def jvp_jaxpr(jaxpr: core.ClosedJaxpr, nonzeros: Sequence[bool],
 def _jvp_jaxpr(jaxpr: core.ClosedJaxpr,
                nonzeros: Sequence[bool], instantiate: Sequence[bool]):
   assert len(jaxpr.in_avals) == len(nonzeros)
-  tangent_avals = [aval.to_tangent_aval()
-                   for aval, nz in zip(jaxpr.in_aval_qdds, nonzeros) if nz]
-  avals_in = FlatTree.flatten(((jaxpr.in_aval_qdds, tangent_avals), {}))
+  primal_avals_in = ft.flatten_list(jaxpr.in_avals)
+  tangent_avals_in = primal_avals_in.map(lambda aval: aval.to_tangent_aval())
+  nz_tangent_avals_in = tangent_avals_in.map2(
+      lambda aval, nz: aval if nz else Zero(aval), nonzeros).filter_with_mask(nonzeros)
+  avals_in = ft.pack_args(primal_avals_in, nz_tangent_avals_in)
   dbg = jaxpr.jaxpr.debug_info.with_unknown_names()
   def f_jvp_traceable(primals, nonzero_tangents):
-    nonzero_tangents_iter = iter(nonzero_tangents)
-    tangents = [next(nonzero_tangents_iter) if nz else p2tz(p)
-              for p, nz in zip(primals, nonzeros)]
-    primals_ft = FlatTree.flatten(primals)
-    tangents_ft = primals_ft.update(tangents)
-    primals_out, tangents_out = jvp(core.jaxpr_as_fun(jaxpr), primals_ft, tangents_ft)
-    out_nonzeros = [type(t) is not Zero for t in tangents_out]
-    nonzero_tangents_out = [t for t in tangents_out if type(t) is not Zero]
-
-    primals_out_ft = FlatTree.flatten(primals_out)
-    
-    # return FlatTree.Flatten((prima
-    # store.store(out_nonzeros)
-    # return (primals_out) + nonzero_tangents_out
+    tangents = nonzero_tangents.unfilter()
+    primals_out, tangents_out = jvp(core.jaxpr_as_fun(jaxpr), primals, tangents)
+    primals_out = ft.flatten_list(primals_out)
+    tangents_out = ft.flatten_list(tangents_out).filter(lambda t: type(t) is not Zero)
+    return ft.pack((primals_out, tangents_out))
 
   jaxpr, out_avals = pe.trace_to_jaxpr(f_jvp_traceable, avals_in, dbg,
+                                       fun_takes_flat_tree_arg=True,
                                        fun_returns_flat_tree=True)
 
-  # ------
-
-  f = lu.wrap_init(core.jaxpr_as_fun(jaxpr),
-                   debug_info=jaxpr.jaxpr.debug_info.with_unknown_names())
-  f_jvp, out_nonzeros = f_jvp_traceable(
-      jvp(f, instantiate=instantiate, transform_stack=False), nonzeros)
-  tangent_avals = [aval.to_tangent_aval()
-                   for aval, nz in zip(jaxpr.in_aval_qdds, nonzeros) if nz]
-  avals_in = list(it.chain(jaxpr.in_aval_qdds, tangent_avals))
-  jaxpr_out, avals_out, literals_out = pe.trace_to_jaxpr_dynamic(
-      f_jvp, avals_in)
-  return core.ClosedJaxpr(jaxpr_out, literals_out), out_nonzeros()
-
-  # ---@lu.transformation_with_aux2
-  # -  def f_jvp_traceable(f, store, nonzeros, *primals_and_nztangents):
-  num_primals = len(nonzeros)
-  primals = list(primals_and_nztangents[:num_primals])
-  nonzero_tangents = iter(primals_and_nztangents[num_primals:])
-  tangents = [next(nonzero_tangents) if nz else p2tz(p)
-              for p, nz in zip(primals, nonzeros)]
-  primals_out, tangents_out = f(primals, tangents)
-  out_nonzeros = [type(t) is not Zero for t in tangents_out]
-  nonzero_tangents_out = [t for t in tangents_out if type(t) is not Zero]
-  store.store(out_nonzeros)
-  return list(primals_out) + nonzero_tangents_out
+  _, nz_tangent_avals_out = out_avals.unpack()
+  tangent_avals_out = nz_tangent_avals_out.unfilter()
+  out_nonzeros = [type(t) is not Zero for t in tangent_avals_out]
+  return jaxpr, out_nonzeros
 
 def rearrange_binders(jaxpr: core.ClosedJaxpr, primals_in, tangents_in, primals_out, tangents_out):
   new_invars = _perm(primals_in, tangents_in, jaxpr.jaxpr.invars)

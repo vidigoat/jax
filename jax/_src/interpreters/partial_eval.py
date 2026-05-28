@@ -2287,6 +2287,8 @@ def trace_to_jaxpr(
     in_avals: FlatTree,  # (args, kwargs) pair
     debug_info: core.DebugInfo,
     *context_for_cache_key,
+    # TODO: let's just make a `trace_to_jaxpr_ft` function for this
+    fun_takes_flat_tree_arg=False,
     fun_returns_flat_tree=False,
     requires_low=False,
 ) -> tuple[ClosedJaxpr, FlatTree]:
@@ -2315,7 +2317,13 @@ def trace_to_jaxpr(
       in_tracers = in_avals.map(partial(trace.new_arg, source_info=source_info))
 
     with core.set_current_trace(trace):
-      args, kwargs = in_tracers.unflatten()
+      if fun_takes_flat_tree_arg:
+        args_ft, kwargs_ft = in_tracers.unpack()
+        assert kwargs_ft.unflatten() == {}  # TODO: handle kwargs
+        kwargs = {}
+        args = args_ft.unpack()
+      else:
+        args, kwargs = in_tracers.unflatten()
       ans_pytree = fun(*args, **kwargs)
       if fun_returns_flat_tree:
         # TODO(dougalm): make result paths optional

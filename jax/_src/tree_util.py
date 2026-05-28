@@ -19,6 +19,7 @@ import dataclasses
 import difflib
 import functools
 from functools import cached_property, partial
+import itertools as it
 import operator as op
 import textwrap
 from typing import Any, TypeVar
@@ -26,7 +27,7 @@ from typing import Any, TypeVar
 from jax._src import traceback_util
 from jax._src.lib import pytree
 from jax._src.util import safe_zip, set_module
-from jax._src.util import unzip2
+from jax._src.util import unzip2, partition_list, merge_lists
 
 
 export = set_module('jax.tree_util')
@@ -1444,6 +1445,11 @@ class FlatTree:
     else:
       assert False, type(tree)
 
+  @staticmethod
+  def pack_args(*args, **kwargs):
+    # TODO: check elements of args and kwargs are all flat trees
+    return FlatTree.pack((args, kwargs))
+
   def unpack(self: FlatTree) -> tuple[FlatTree, ...]:
     # TODO: this is O(N) not O(1) (with N as the number of leaves). If it
     # becomes a problem we can fix it with a fancier data structure.
@@ -1554,16 +1560,43 @@ class FlatTree:
     # a FlatTree version of list.filter. Unlike the latter, it keeps
     # the filtered-out data in the pytree structure, so that it can
     # be reinstantiated with `unfilter`.
-    assert False
+    xs = self.vals
+    tree = self.tree
+    statics = self.statics
+    keep_mask = [f(x) for x in xs]
+    rejected, kept = partition_list(keep_mask, xs)
+    return FlatTree.flatten_list(kept).with_aux((tree, statics, keep_mask, rejected))
+
+  def filter_with_mask(self, mask):
+    # a FlatTree version of list.filter. Unlike the latter, it keeps
+    # the filtered-out data in the pytree structure, so that it can
+    # be reinstantiated with `unfilter`.
+    xs = self.vals
+    tree = self.tree
+    statics = self.statics
+    keep_mask = list(mask)
+    rejected, kept = partition_list(keep_mask, xs)
+    return FlatTree.flatten_list(kept).with_aux((tree, statics, keep_mask, rejected))
 
   def unfilter(self):
-    assert False
+    kept_ft, (tree, statics, keep_mask, rejected) = self.unpack_aux()
+    kept_list = kept_ft.unflatten()
+    xs = merge_lists(keep_mask, rejected, kept_list)
+    return FlatTree(xs, tree, statics)
 
-def unfilter_pytree(x, f):
-  pass
+  def enumerate(self):
+    idxs = it.count()
+    return self.map(lambda x: (next(idxs), x))
 
+  @staticmethod
+  def flatten_list(xs):
+    # [a] -> FlatTree[a] . Treats list elements as leaves.
+    return FlatTree.pack(tuple(FlatTree.singleton(x) for x in xs))
 
-
+  def singleton(x):
+    # a -> FlatTree[a]
+    _, tree = tracing_registry.flatten((0))
+    return FlatTree([x], tree, False)
 
 def unwrap_statics(pytree, statics):
   if statics is False:
