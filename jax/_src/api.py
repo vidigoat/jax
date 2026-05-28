@@ -534,24 +534,15 @@ def value_and_grad(fun: Callable, argnums: int | Sequence[int] = 0,
                       f"but got only {len(args)} positional arguments.")
     dbg = debug_info('value_and_grad', fun, args, kwargs)
 
-    f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
-    f_partial, dyn_args = argnums_partial(f, argnums, args,
-                                          require_static_args_hashable=False)
+    f_partial, dyn_args = argnums_partial2(fun, argnums, args, kwargs)
     for leaf in tree_leaves(dyn_args):
       _check_input_dtype_grad(holomorphic, allow_int, leaf)
-    if has_aux:
-      ans, vjp_py, aux = _vjp(f_partial, *dyn_args, has_aux=True)
-    else:
-      ans, vjp_py = _vjp(f_partial, *dyn_args)
-      aux = None
+    ans, vjp_py, *maybe_aux = vjp(f_partial, *dyn_args, has_aux=has_aux) 
     _check_scalar(ans)
     tree_map(partial(_check_output_dtype_grad, holomorphic), ans)
     g = vjp_py(lax_internal._one_vjp(ans))
     g = g[0] if isinstance(argnums, int) else g
-    if not has_aux:
-      return ans, g
-    else:
-      return (ans, aux), g
+    return (ans, *maybe_aux), g
 
   return value_and_grad_f
 
@@ -1635,45 +1626,24 @@ def vjp(
     raise NotImplementedError("reduce_axes argument to vjp is deprecated")
   del reduce_axes
   check_callable(fun)
-  wrapped_fun = lu.wrap_init(
-      fun, debug_info=debug_info("vjp", fun, primals, {}))
-  return _vjp(wrapped_fun, *primals, has_aux=has_aux)
-
-def _vjp(fun, *primals, has_aux=False):
+  dbg = debug_info("vjp", fun, primals, {})
   canon = lambda x: x if isinstance(x, core.Tracer) else canonicalize_value(x)
-  primals = tree_map(canon, primals)
-  primals_flat, in_tree = tree_flatten(primals)
-  for arg in primals_flat:
-    dispatch.check_arg(arg)
-  if not has_aux:
-    flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
-    out_primals_flat, out_known, jaxpr, residuals = ad.linearize(
-        flat_fun, *primals_flat, is_vjp=True)
-    out_tree = out_tree()
-    aux = aux_tree = None
-  else:
-    flat_fun, out_aux_trees = flatten_fun_nokwargs2(fun, in_tree)
-    out_primals_flat, out_known, jaxpr, residuals, aux = ad.linearize(
-        flat_fun, *primals_flat, has_aux=True, is_vjp=True)
-    out_tree, aux_tree = out_aux_trees()
-    del out_aux_trees
-  id_map = {id(x): i for i, x in enumerate(primals_flat)}
+  primals_ft = FlatTree.flatten(primals).map(canon)
+  primals_ft.map(dispatch.check_arg)
+  out_primals_ft, out_known, jaxpr, residuals, *maybe_aux = ad.linearize(
+      fun, primals_ft, is_vjp=True, has_aux=has_aux, dbg=dbg)
+
+  id_map = {id(x): i for i, x in enumerate(primals_ft)}
   used, opaque_residuals = set(), []
   spec = [used.add(id(r)) or RSpec(id_map[id(r)], True) if id(r) in id_map else
           RSpec(opaque_residuals.append(r) or (len(opaque_residuals) - 1), False)
           for r in residuals]
   args_res = tuptree_map(lambda x: x if id(x) in used else NotNeeded(),
-                         in_tree, primals_flat)
-  out_primal_avals = [typeof(x) for x in out_primals_flat]
+                         primals_ft.tree, list(primals_ft))
+  out_primal_avals = list(out_primals_ft.map(typeof))
   f_vjp = VJP(partial(_vjp3_callable, spec, out_known, jaxpr, out_primal_avals),
-              in_tree, out_tree, list(args_res), opaque_residuals)
-  out_primals = tree_unflatten(out_tree, out_primals_flat)
-  if not has_aux:
-    return out_primals, f_vjp
-  else:
-    assert aux is not None
-    assert aux_tree is not None
-    return out_primals, f_vjp, tree_unflatten(aux_tree, aux)
+              primals_ft.tree, out_primals_ft.tree, list(args_res), opaque_residuals)
+  return out_primals_ft.unflatten(), f_vjp, *maybe_aux
 
 def _vjp3_callable(spec, out_known, jaxpr, out_primal_avals, in_tree, out_tree,
                    args_res, opaque_res, *maybe_ct_refs):
