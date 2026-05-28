@@ -61,8 +61,7 @@ from jax._src import xla_bridge as xb
 from jax._src.core import eval_jaxpr, shaped_abstractify, ShapedArray, typeof
 from jax._src.api_util import (
   flatten_fun_nokwargs, flatten_fun_nokwargs2, argnums_partial,
-  flatten_axes, _ensure_index, apply_flat_fun_nokwargs,
-  check_callable, debug_info, argnums_partial2)
+  flatten_axes, _ensure_index, check_callable, debug_info, argnums_partial2)
 from jax._src.lib import jax_jit
 from jax._src.lib import xla_client as xc
 from jax._src.sharding import Sharding
@@ -1520,67 +1519,55 @@ def linearize(fun: Callable, *primals, has_aux: bool = False
   -6.676704
   """
   check_callable(fun)
-  f = lu.wrap_init(fun, debug_info=debug_info("linearize", fun, primals, {}))
-  primals_flat, in_tree = tree_flatten(primals)
-  if has_aux:
-    jaxtree_fun, out_tree = flatten_fun_nokwargs2(f, in_tree)
-  else:
-    jaxtree_fun, out_tree = flatten_fun_nokwargs(f, in_tree)
-  out_primals, out_known, jaxpr, consts, *maybe_aux = ad.linearize(
-      jaxtree_fun, *primals_flat, has_aux=has_aux)
-  if has_aux:
-    out_tree, aux_tree = out_tree()
-  else:
-    out_tree, aux_tree = out_tree(), None
-  out_primal_py = tree_unflatten(out_tree, out_primals)
-  in_avals = list(map(core.typeof, primals_flat))
-  out_avals = list(map(core.typeof, out_primals))
-  lifted_jvp = Partial(partial(_lift_linearized, jaxpr, in_avals, out_avals,
-                               (in_tree, out_tree), out_known), consts)
-  if has_aux:
-    [aux] = maybe_aux
-    assert aux_tree is not None
-    return out_primal_py, lifted_jvp, tree_unflatten(aux_tree, aux)
-  else:
-    [] = maybe_aux
-    return out_primal_py, lifted_jvp
+  dbg = debug_info("linearize", fun, primals, {})
+  primals_ft = FlatTree.flatten(primals)
+  out_primals_ft, out_known, jaxpr, consts, *maybe_aux = ad.linearize(
+      fun, primals_ft, has_aux=has_aux, dbg=dbg)
+  out_primal_py = out_primals_ft.unflatten()
+  in_avals = primals_ft.map(core.typeof)
+  out_avals = out_primals_ft.map(core.typeof)
+  lifted_jvp = Partial(
+      partial(_lift_linearized, jaxpr, in_avals, out_avals, out_known), consts)
+  return out_primals_ft.unflatten(), lifted_jvp, *maybe_aux
 
-def _lift_linearized(jaxpr, in_avals, out_avals, io_tree, out_known, consts, *py_args):
-  def fun(*tangents):
-    tangent_avals = list(map(core.typeof, tangents))
-    for primal_aval, tangent_aval in zip(in_avals, tangent_avals):
-      expected_tangent_aval  = primal_aval.to_tangent_aval()
-      if not core.typecompat(expected_tangent_aval, tangent_aval):
-        extra_msg = ''
-        if (isinstance(primal_aval, core.ShapedArray) and
-            isinstance(tangent_aval, core.ShapedArray) and
-            primal_aval.mat != tangent_aval.mat):
-          # TODO(yashkatariya): Tweak error.
-          pvary_applications = []
-          if left := tangent_aval.mat.varying - primal_aval.mat.varying:
-            pvary_applications.append(
-                f"applying `jax.lax.pcast(..., {tuple(left)}, to='varying')` to"
-                " the primal value passed to `jax.linearize`")
-          if left := primal_aval.mat.varying - tangent_aval.mat.varying:
-            pvary_applications.append(
-                f"applying `jax.lax.pcast(..., {tuple(left)}, to='varying')` to"
-                " the tangent value passed to the callable `f_jvp` returned by"
-                " `jax.linearize`")
-          extra_msg = " \nThis might be fixed by:\n" + "\n".join(
-              f"  * {d};" for d in pvary_applications)
-        raise ValueError(
-            "linearized function called on tangent values inconsistent with "
-            "the original primal values:\n"
-            f"Got tangent aval {tangent_aval} for primal aval {primal_aval} "
-            f"but expected {expected_tangent_aval}.{extra_msg}")
-    tangents_out = eval_jaxpr(jaxpr, consts, *tangents)
-    tangents_out_ = iter(tangents_out)
-    full_out = [a2tz(aval).instantiate() if known else next(tangents_out_)
-                for aval, known in zip(out_avals, out_known)]
-    assert next(tangents_out_, None) is None
-    return full_out
+def _lift_linearized(jaxpr, in_avals, out_avals, out_known, consts, *tangents):
+  tangents_ft = FlatTree.flatten(tangents)
+  if tangents_ft.tree != in_avals.tree:
+    raise TypeError(f"expected {in_avals.tree}, got {tangents_ft.tree}")
 
-  return apply_flat_fun_nokwargs(fun, io_tree, py_args)
+  tangent_avals = tangents_ft.map(core.typeof)
+  for primal_aval, tangent_aval in zip(in_avals, tangent_avals):
+    expected_tangent_aval  = primal_aval.to_tangent_aval()
+    if not core.typecompat(expected_tangent_aval, tangent_aval):
+      extra_msg = ''
+      if (isinstance(primal_aval, core.ShapedArray) and
+          isinstance(tangent_aval, core.ShapedArray) and
+          primal_aval.mat != tangent_aval.mat):
+        # TODO(yashkatariya): Tweak error.
+        pvary_applications = []
+        if left := tangent_aval.mat.varying - primal_aval.mat.varying:
+          pvary_applications.append(
+              f"applying `jax.lax.pcast(..., {tuple(left)}, to='varying')` to"
+              " the primal value passed to `jax.linearize`")
+        if left := primal_aval.mat.varying - tangent_aval.mat.varying:
+          pvary_applications.append(
+              f"applying `jax.lax.pcast(..., {tuple(left)}, to='varying')` to"
+              " the tangent value passed to the callable `f_jvp` returned by"
+              " `jax.linearize`")
+        extra_msg = " \nThis might be fixed by:\n" + "\n".join(
+            f"  * {d};" for d in pvary_applications)
+      raise ValueError(
+          "linearized function called on tangent values inconsistent with "
+          "the original primal values:\n"
+          f"Got tangent aval {tangent_aval} for primal aval {primal_aval} "
+          f"but expected {expected_tangent_aval}.{extra_msg}")
+  tangents_out = eval_jaxpr(jaxpr, consts, *tangents)
+  tangents_out_ = iter(tangents_out)
+  full_out = [a2tz(aval).instantiate() if known else next(tangents_out_)
+              for aval, known in zip(out_avals, out_known)]
+  assert next(tangents_out_, None) is None
+  return out_avals.update(full_out).unflatten()
+
 
 # TODO(mattjj): see similar function in custom_derivatives.py
 def _temporary_dtype_exception(a, a_) -> bool:

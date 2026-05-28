@@ -93,14 +93,6 @@ def flatten_fun_nokwargs(f: Callable, store: lu.Store,
   store.store(out_tree)
   return ans
 
-def apply_flat_fun_nokwargs(fun, io_tree, py_args):
-  in_tree_expected, out_tree = io_tree
-  args, in_tree = tree_flatten(py_args)
-  if in_tree != in_tree_expected:
-    raise TypeError(f"Expected {in_tree_expected}, got {in_tree}")
-  ans = fun(*args)
-  return tree_unflatten(out_tree, ans)
-
 @lu.transformation_with_aux2
 def flatten_fun_nokwargs2(f, store, in_tree, *args_flat):
   py_args = tree_unflatten(in_tree, args_flat)

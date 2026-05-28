@@ -298,30 +298,32 @@ def _dce_consts(jaxpr, consts):
       [False] * len(jaxpr.constvars) + [True] * len(jaxpr.invars))
   return jaxpr, [c for c, used in zip(consts, used_consts) if used]
 
-def direct_linearize(traceable, primals, *, has_aux, is_vjp):
-  dbg = traceable.debug_info.with_unknown_names()
+def direct_linearize(traceable, primals_ft, *, has_aux, is_vjp, dbg):
+  dbg = dbg.with_unknown_names()
   tag = core.TraceTag()
   with core.take_current_trace() as parent_trace:
     source_info = source_info_util.current()
     tangent_trace = pe.DynamicJaxprTrace(dbg, auto_dce=True)
-    tangents = [tangent_trace.new_arg(typeof(p).to_tangent_aval(), source_info) for p in primals]
-    tangents = [p2tz(t) if not isinstance(t, Zero)
-                and isinstance(typeof(t), core.ShapedArray)
-                and dtype(t) == float0 else t for t in tangents]
     tangent_trace.tag = tag
     lin_trace = LinearizeTrace(parent_trace, tangent_trace, is_vjp)
-    tracers = [LinearizeTracer(lin_trace, p, t) for p, t in zip(primals, tangents)]
-    tracers = [t.full_lower() for t in tracers]
+    def make_tracer(p):
+      t = tangent_trace.new_arg(typeof(p).to_tangent_aval(), source_info)
+      if (not isinstance(t, Zero) 
+          and isinstance(typeof(t), core.ShapedArray) 
+          and dtype(t) == float0):
+        t = p2tz(t)
+      return LinearizeTracer(lin_trace, p, t).full_lower()
+    tracers = primals_ft.map(make_tracer)
+
     with (core.set_current_trace(lin_trace),
           source_info_util.transform_name_stack('jvp')):
+      ans = traceable(*tracers.unflatten())
+      auxs = ()
       if has_aux:
-        ans, aux = traceable.call_wrapped(*tracers)
-        aux = [x.primal if type(x) is LinearizeTracer and x._trace.tag is tag
-               else x for x in aux]
-      else:
-        ans = traceable.call_wrapped(*tracers)
-        aux = None
-      out_primals, out_tangents = unzip2(map(lin_trace.to_primal_tangent_pair, ans))
+        ans, aux = ans
+        auxs = (aux,)
+      out_primals, out_tangents = ft.flatten(ans).map(
+          lin_trace.to_primal_tangent_pair).unzip2()
       del lin_trace, ans, tracers
   out_nzs = [type(t) is not Zero for t in out_tangents]
   out_nz_tangents = [t for t, nz in zip(out_tangents, out_nzs) if nz]
@@ -335,14 +337,12 @@ def direct_linearize(traceable, primals, *, has_aux, is_vjp):
       [False] * len(jaxpr.constvars) + [True] * len(jaxpr.invars))
   consts = [c for c, used in zip(consts, used_consts) if used]
   out_zeros = map(op.not_, out_nzs)
-  if has_aux:
-    return out_primals, out_zeros, jaxpr, consts, aux
-  else:
-    return out_primals, out_zeros, jaxpr, consts
+  return out_primals, out_zeros, jaxpr, consts, *auxs
 
-def linearize(traceable: lu.WrappedFun, *primals, has_aux=False, is_vjp=False):
+def linearize(traceable: Callable, primals_ft, dbg, has_aux=False, is_vjp=False):
   if config.use_direct_linearize.value:
-    return direct_linearize(traceable, primals, has_aux=has_aux, is_vjp=is_vjp)
+    return direct_linearize(traceable, primals_ft,
+                            has_aux=has_aux, is_vjp=is_vjp, dbg=dbg)
   if has_aux:
     jvpfun, aux = jvp(traceable, has_aux=True)
   else:
