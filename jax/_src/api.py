@@ -62,7 +62,7 @@ from jax._src.core import eval_jaxpr, shaped_abstractify, ShapedArray, typeof
 from jax._src.api_util import (
   flatten_fun_nokwargs, flatten_fun_nokwargs2, argnums_partial,
   flatten_axes, _ensure_index, apply_flat_fun_nokwargs,
-  check_callable, debug_info)
+  check_callable, debug_info, argnums_partial2)
 from jax._src.lib import jax_jit
 from jax._src.lib import xla_client as xc
 from jax._src.sharding import Sharding
@@ -730,13 +730,7 @@ def jacfwd(fun: Callable, argnums: int | Sequence[int] = 0,
 
   @wraps(fun, docstr=docstr, argnums=argnums)
   def jacfun(*args, **kwargs):
-    f = lu.wrap_init(
-        fun, kwargs,
-        debug_info=debug_info(
-            "jacfwd", fun, args, kwargs,
-            static_argnums=(argnums,) if isinstance(argnums, int) else argnums))
-    f_partial, dyn_args = argnums_partial(f, argnums, args,
-                                          require_static_args_hashable=False)
+    f_partial, dyn_args = argnums_partial2(fun, argnums, args, kwargs)
     tree_map(partial(_check_input_dtype_jacfwd, holomorphic), dyn_args)
     pushfwd: Callable = partial(_jvp, f_partial, dyn_args, has_aux=has_aux)
     if has_aux:

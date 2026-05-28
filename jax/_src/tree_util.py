@@ -1382,7 +1382,7 @@ class FlatTree:
     assert isinstance(treedef, pytree.PyTreeDef)
     if not isinstance(vals, tuple):
       vals = tuple(vals)
-    self.vals = tuple(vals)
+    self.vals = vals
     self.tree = treedef
     self.statics = statics  # tree-prefix tuple-dict-tree of bools
 

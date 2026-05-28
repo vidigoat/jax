@@ -2322,6 +2322,7 @@ def trace_to_jaxpr(
         assert kwargs_ft.unflatten() == {}  # TODO: handle kwargs
         kwargs = {}
         args = args_ft.unpack()
+        del args_ft
       else:
         args, kwargs = in_tracers.unflatten()
       ans_pytree = fun(*args, **kwargs)

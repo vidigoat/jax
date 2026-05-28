@@ -88,7 +88,7 @@ def jvp(fun: Callable, primals, tangents, has_aux=False, instantiate=True,
         lambda t, inst: instantiate_zeros(t) if inst else t, instantiate)
   if has_aux:
     aux = (FlatTree.flatten(aux).map(
-           lambda x: x.primal if isinstance(x, JVPTracer) 
+           lambda x: x.primal if isinstance(x, JVPTracer)
            and x._trace.tag is tag else x),)
   else:
     aux = ()
@@ -1283,7 +1283,9 @@ def _jvp_jaxpr(jaxpr: core.ClosedJaxpr,
   dbg = jaxpr.jaxpr.debug_info.with_unknown_names()
   def f_jvp_traceable(primals, nonzero_tangents):
     tangents = nonzero_tangents.unfilter()
-    primals_out, tangents_out = jvp(core.jaxpr_as_fun(jaxpr), primals, tangents)
+    primals_out, tangents_out = jvp(core.jaxpr_as_fun(jaxpr), primals, tangents,
+                                    instantiate=instantiate,
+                                    transform_stack=False)
     primals_out = ft.flatten_list(primals_out)
     tangents_out = ft.flatten_list(tangents_out).filter(lambda t: type(t) is not Zero)
     return ft.pack((primals_out, tangents_out))

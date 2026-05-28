@@ -31,7 +31,7 @@ from jax._src.tree_util import (
     broadcast_flattened_prefix_with_treedef, treedef_is_leaf, tree_structure,
     tracing_registry)
 from jax._src import linear_util as lu
-from jax._src.util import safe_map, HashableFunction, Unhashable, safe_zip
+from jax._src.util import safe_map, HashableFunction, Unhashable, safe_zip, partition_list, merge_lists
 from jax._src import traceback_util
 
 traceback_util.register_exclusion(__file__)
@@ -223,6 +223,18 @@ def argnums_partial(f: lu.WrappedFun, dyn_argnums: int | Sequence[int],
   dyn_args = tuple(args[i] for i in dyn_argnums)
   return _argnums_partial(f, dyn_argnums, tuple(fixed_args)), dyn_args
 
+def argnums_partial2(f: Callable, dyn_argnums: int | Sequence[int],
+                     args: Sequence, kwargs: dict):
+  # like argnums_partial but works with callables instead of WrappedFun
+  dyn_argnums = _ensure_index_tuple(dyn_argnums)
+  dyn_argnums = _ensure_inbounds(False, len(args), dyn_argnums)
+  dyn_mask = [i in dyn_argnums for i in range(len(args))]
+  static_args, dyn_args = partition_list(dyn_mask, args)
+  def f_wrapped(*dyn_args_):
+    args_ = merge_lists(dyn_mask, static_args, dyn_args_)
+    return f(*args_, **kwargs)
+
+  return f_wrapped, dyn_args
 
 def prepend_static_args(f, static_args):
   return _prepend_static_args(f, tuple(Unhashable(arg) for arg in static_args))
