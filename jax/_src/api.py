@@ -537,7 +537,7 @@ def value_and_grad(fun: Callable, argnums: int | Sequence[int] = 0,
     f_partial, dyn_args = argnums_partial2(fun, argnums, args, kwargs)
     for leaf in tree_leaves(dyn_args):
       _check_input_dtype_grad(holomorphic, allow_int, leaf)
-    ans, vjp_py, *maybe_aux = vjp(f_partial, *dyn_args, has_aux=has_aux) 
+    ans, vjp_py, *maybe_aux = vjp(f_partial, *dyn_args, has_aux=has_aux)
     _check_scalar(ans)
     tree_map(partial(_check_output_dtype_grad, holomorphic), ans)
     g = vjp_py(lax_internal._one_vjp(ans))
@@ -808,29 +808,16 @@ def jacrev(fun: Callable, argnums: int | Sequence[int] = 0,
 
   @wraps(fun, docstr=docstr, argnums=argnums)
   def jacfun(*args, **kwargs):
-    f = lu.wrap_init(
-        fun, kwargs,
-        debug_info=debug_info(
-            "jacrev", fun, args, kwargs,
-            static_argnums=(argnums,) if isinstance(argnums, int) else argnums))
-    f_partial, dyn_args = argnums_partial(f, argnums, args,
-                                          require_static_args_hashable=False)
+    f_partial, dyn_args = argnums_partial2(fun, argnums, args, kwargs)
     tree_map(partial(_check_input_dtype_jacrev, holomorphic, allow_int), dyn_args)
-    if has_aux:
-      y, pullback, aux = _vjp(f_partial, *dyn_args, has_aux=True)
-    else:
-      y, pullback = _vjp(f_partial, *dyn_args)
-      aux = None
+    y, pullback, *maybe_aux = vjp(f_partial, *dyn_args, has_aux=has_aux)
     tree_map(partial(_check_output_dtype_jacrev, holomorphic), y)
     jac = vmap(pullback)(_std_basis(y))
     jac = jac[0] if isinstance(argnums, int) else jac
     example_args = dyn_args[0] if isinstance(argnums, int) else dyn_args
     jac_tree = tree_map(partial(_jacrev_unravel, y), example_args, jac)
     jac_tree = tree_transpose(tree_structure(example_args), tree_structure(y), jac_tree)
-    if not has_aux:
-      return jac_tree
-    else:
-      return jac_tree, aux
+    return (jac_tree, *maybe_aux) if has_aux else jac_tree
 
   return jacfun
 
